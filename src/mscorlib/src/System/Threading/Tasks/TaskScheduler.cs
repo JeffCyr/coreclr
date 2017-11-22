@@ -448,6 +448,33 @@ namespace System.Threading.Tasks
             return task.ExecuteEntry();
         }
 
+        //TODO xmldoc
+        protected bool TrySetException(Task task, Exception exception)
+        {
+            if (exception == null)
+            {
+                ThrowHelper.ThrowArgumentNullException(ExceptionArgument.exception);
+            }
+
+            if (task.ExecutingTaskScheduler != this)
+            {
+                throw new InvalidOperationException(SR.TaskScheduler_ExecuteTask_WrongTaskScheduler);
+            }
+
+            return task.TrySetException(exception);
+        }
+
+        //TODO xmldoc
+        protected bool TrySetCanceled(Task task)
+        {
+            if (task.ExecutingTaskScheduler != this)
+            {
+                throw new InvalidOperationException(SR.TaskScheduler_ExecuteTask_WrongTaskScheduler);
+            }
+
+            return task.TrySetCanceled(CancellationToken.None);
+        }
+
         ////////////////////////////////////////////////////////////
         //
         // Events
