@@ -880,7 +880,7 @@ namespace System.Threading.Tasks
         // Atomically mark a Task as started while making sure that it is not canceled.
         internal bool MarkStarted()
         {
-            return AtomicStateUpdate(TASK_STATE_STARTED, TASK_STATE_CANCELED | TASK_STATE_STARTED);
+            return AtomicStateUpdate(TASK_STATE_STARTED, TASK_STATE_COMPLETED_MASK | TASK_STATE_COMPLETION_RESERVED);
         }
 
         internal bool FireTaskScheduledIfNeeded(TaskScheduler ts)
@@ -1168,8 +1168,7 @@ namespace System.Threading.Tasks
             }
             else
             {
-                Debug.Assert((m_stateFlags & TASK_STATE_CANCELED) != 0, "Task.RunSynchronously: expected TASK_STATE_CANCELED to be set");
-                // Can't call this method on canceled task.
+                // Can't call this method on a completed task.
                 ThrowHelper.ThrowInvalidOperationException(ExceptionResource.Task_RunSynchronously_TaskCompleted);
             }
         }
@@ -2023,11 +2022,10 @@ namespace System.Threading.Tasks
         // and the "real" task ends up with multiple exceptions, which is possible when
         // a task has children.
         //
-        // Called from TaskCompletionSource<T>.SetException(IEnumerable<Exception>).
+        // Called from TaskCompletionSource<T>.SetException(IEnumerable<Exception>)
+        // and TaskScheduler.TrySetException(Task, Exception).
         internal bool TrySetException(object exceptionObject)
         {
-            Debug.Assert(m_action == null, "Task<T>.TrySetException(): non-null m_action");
-
             // TCS.{Try}SetException() should have checked for this
             Debug.Assert(exceptionObject != null, "Expected non-null exceptionObject argument");
 
@@ -2041,7 +2039,7 @@ namespace System.Threading.Tasks
 
             // "Reserve" the completion for this task, while making sure that: (1) No prior reservation
             // has been made, (2) The result has not already been set, (3) An exception has not previously 
-            // been recorded, and (4) Cancellation has not been requested.
+            // been recorded, (4) Cancellation has not been requested, and (5) The delegate has not been invoked.
             //
             // If the reservation is successful, then add the exception(s) and finish completion processing.
             //
@@ -2049,7 +2047,7 @@ namespace System.Threading.Tasks
             // anyway.  Some downstream logic may depend upon an inflated m_contingentProperties.
             EnsureContingentPropertiesInitialized();
             if (AtomicStateUpdate(TASK_STATE_COMPLETION_RESERVED,
-                TASK_STATE_COMPLETION_RESERVED | TASK_STATE_RAN_TO_COMPLETION | TASK_STATE_FAULTED | TASK_STATE_CANCELED))
+                TASK_STATE_COMPLETION_RESERVED | TASK_STATE_COMPLETED_MASK | TASK_STATE_DELEGATE_INVOKED))
             {
                 AddException(exceptionObject); // handles singleton exception or exception collection
                 Finish(false);
@@ -2061,7 +2059,6 @@ namespace System.Threading.Tasks
 
         // internal helper function breaks out logic used by TaskCompletionSource and AsyncMethodBuilder
         // If the tokenToRecord is not None, it will be stored onto the task.
-        // This method is only valid for promise tasks.
         internal bool TrySetCanceled(CancellationToken tokenToRecord)
         {
             return TrySetCanceled(tokenToRecord, null);
@@ -2070,10 +2067,15 @@ namespace System.Threading.Tasks
         // internal helper function breaks out logic used by TaskCompletionSource and AsyncMethodBuilder
         // If the tokenToRecord is not None, it will be stored onto the task.
         // If the OperationCanceledException is not null, it will be stored into the task's exception holder.
-        // This method is only valid for promise tasks.
         internal bool TrySetCanceled(CancellationToken tokenToRecord, object cancellationException)
         {
-            Debug.Assert(m_action == null, "Task<T>.TrySetCanceled(): non-null m_action");
+            Debug.Assert(
+                !(
+                    (Options & (TaskCreationOptions)InternalTaskOptions.PromiseTask) != 0 &&
+                    (tokenToRecord != default(CancellationToken) || cancellationException != null)
+                ),
+                "Task.TrySetCanceled(): can only set CancellationToken with promise tasks");
+
 #if DEBUG
             var ceAsEdi = cancellationException as ExceptionDispatchInfo;
             Debug.Assert(
@@ -2087,16 +2089,11 @@ namespace System.Threading.Tasks
 
             // "Reserve" the completion for this task, while making sure that: (1) No prior reservation
             // has been made, (2) The result has not already been set, (3) An exception has not previously 
-            // been recorded, and (4) Cancellation has not been requested.
+            // been recorded, (4) Cancellation has not been requested, and (5) The delegate has not been invoked.
             //
             // If the reservation is successful, then record the cancellation and finish completion processing.
-            //
-            // Note: I had to access static Task variables through Task<object>
-            // instead of Task, because I have a property named Task and that
-            // was confusing the compiler.  
-            if (AtomicStateUpdate(Task<object>.TASK_STATE_COMPLETION_RESERVED,
-                Task<object>.TASK_STATE_COMPLETION_RESERVED | Task<object>.TASK_STATE_CANCELED |
-                Task<object>.TASK_STATE_FAULTED | Task<object>.TASK_STATE_RAN_TO_COMPLETION))
+            if (AtomicStateUpdate(TASK_STATE_COMPLETION_RESERVED,
+                TASK_STATE_COMPLETION_RESERVED | TASK_STATE_COMPLETED_MASK | TASK_STATE_DELEGATE_INVOKED))
             {
                 RecordInternalCancellationRequest(tokenToRecord, cancellationException);
                 CancellationCleanupLogic(); // perform cancellation cleanup actions
@@ -2395,7 +2392,7 @@ namespace System.Threading.Tasks
             // If this method has already been called for this task, or if this task has already completed, then
             // return before actually calling Finish().
             if (!AtomicStateUpdate(TASK_STATE_THREAD_WAS_ABORTED,
-                            TASK_STATE_THREAD_WAS_ABORTED | TASK_STATE_RAN_TO_COMPLETION | TASK_STATE_FAULTED | TASK_STATE_CANCELED))
+                            TASK_STATE_THREAD_WAS_ABORTED | TASK_STATE_COMPLETED_MASK | TASK_STATE_COMPLETION_RESERVED))
             {
                 return;
             }
@@ -2457,6 +2454,9 @@ namespace System.Threading.Tasks
             return true;
         }
 
+        /// <summary>
+        /// Do not use if double execution is possible or if TrySetCanceled/TrySetException can be called on this task.
+        /// </summary>
         internal void ExecuteEntryUnsafe() // used instead of ExecuteEntry() when we don't have to worry about double-execution prevent
         {
             // Remember that we started running the task delegate.
@@ -3167,7 +3167,7 @@ namespace System.Threading.Tasks
                     // Even though this task can't have any children, we should be ready for handling any continuations that 
                     // may be attached to it (although currently 
                     // So we need to remeber whether we actually did the flip, so we can do clean up (finish continuations etc)
-                    mustCleanup = AtomicStateUpdate(TASK_STATE_CANCELED, TASK_STATE_DELEGATE_INVOKED | TASK_STATE_CANCELED);
+                    mustCleanup = AtomicStateUpdate(TASK_STATE_CANCELED, TASK_STATE_DELEGATE_INVOKED | TASK_STATE_CANCELED | TASK_STATE_FAULTED| TASK_STATE_COMPLETION_RESERVED);
 
                     // PS: This is slightly different from the regular cancellation codepath 
                     // since we record the cancellation request *after* doing the state transition. 
@@ -3186,8 +3186,6 @@ namespace System.Threading.Tasks
                 //     2) if the task seems to be yet unstarted, and we can transition to
                 //        TASK_STATE_CANCELED before anyone else can transition into _STARTED or _CANCELED or 
                 //        _RAN_TO_COMPLETION or _FAULTED
-                // Note that we do not check for TASK_STATE_COMPLETION_RESERVED.  That only applies to promise-style
-                // tasks, and a promise-style task should not enter into this codepath.
                 if (bPopSucceeded)
                 {
                     // hitting this would mean something wrong with the AtomicStateUpdate above
@@ -3195,13 +3193,12 @@ namespace System.Threading.Tasks
 
                     // Include TASK_STATE_DELEGATE_INVOKED in "illegal" bits to protect against the situation where
                     // TS.TryDequeue() returns true but the task is still left on the queue.
-                    mustCleanup = AtomicStateUpdate(TASK_STATE_CANCELED, TASK_STATE_CANCELED | TASK_STATE_DELEGATE_INVOKED);
+                    mustCleanup = AtomicStateUpdate(TASK_STATE_CANCELED, TASK_STATE_CANCELED | TASK_STATE_FAULTED | TASK_STATE_DELEGATE_INVOKED | TASK_STATE_COMPLETION_RESERVED);
                 }
                 else if (!mustCleanup && (m_stateFlags & TASK_STATE_STARTED) == 0)
                 {
                     mustCleanup = AtomicStateUpdate(TASK_STATE_CANCELED,
-                        TASK_STATE_CANCELED | TASK_STATE_STARTED | TASK_STATE_RAN_TO_COMPLETION |
-                        TASK_STATE_FAULTED | TASK_STATE_DELEGATE_INVOKED);
+                        TASK_STATE_STARTED | TASK_STATE_COMPLETED_MASK | TASK_STATE_DELEGATE_INVOKED | TASK_STATE_COMPLETION_RESERVED);
                 }
 
                 // do the cleanup (i.e. set completion event and finish continuations)
@@ -3231,8 +3228,12 @@ namespace System.Threading.Tasks
         {
             RecordInternalCancellationRequest();
 
-            Debug.Assert((Options & (TaskCreationOptions)InternalTaskOptions.PromiseTask) != 0, "Task.RecordInternalCancellationRequest(CancellationToken) only valid for promise-style task");
-            Debug.Assert(m_contingentProperties.m_cancellationToken == default(CancellationToken));
+            Debug.Assert(
+                !(
+                    (Options & (TaskCreationOptions)InternalTaskOptions.PromiseTask) != 0 &&
+                    m_contingentProperties.m_cancellationToken != default(CancellationToken)
+                ),
+                "Task.RecordInternalCancellationRequest(CancellationToken) cannot replace existing cancellationToken");
 
             // Store the supplied cancellation token as this task's token.
             // Waiting on this task will then result in an OperationCanceledException containing this token.
